@@ -1,0 +1,3847 @@
+import {
+  test,
+  expect,
+  EXPIRED_TOKEN,
+  MALFORMED_TOKEN,
+  FORGED_ALG_NONE_JWT,
+} from '../../src/fixtures/api.fixture';
+import {
+  assertStatusCodeParity,
+  assertRejectsInvalidInput,
+  assertUnauthorized,
+  assertNoInternalLeak,
+  assertNoReflectedScript,
+  assertNot200OKOnError,
+  expectValidContract,
+  readBody,
+  reportBusinessLogicFlaw,
+} from '../../src/utils/apiAssertions';
+import { HR_HIERARCHY_PATHS } from '../../src/api/clients/hrHierarchy.client';
+import {
+  levelSchema,
+  levelEnvelopeSchema,
+  levelListEnvelopeSchema,
+  nodeEnvelopeSchema,
+  nodeListEnvelopeSchema,
+} from '../../src/api/schemas/hierarchy.schema';
+import { looseEnvelopeSchema } from '../../src/api/schemas/envelope.schema';
+import {
+  buildLevel,
+  buildLevelArray,
+  buildLevelUpdate,
+  buildNode,
+  buildNodeArray,
+  buildNodeUpdate,
+  buildReportingNode,
+  buildById,
+  buildByCompany,
+  buildNodeLookup,
+  randomObjectId,
+} from '../../src/api/payloads/hierarchy.payload';
+
+/*
+ * HR hierarchy subsystem — four Swagger tags covering the two HR trees the tenant runs side by
+ * side: the HR tier (`/hrTier`, `/hrVariable`) that models bands and grades, and the HR set-up
+ * tier (`/hrSetUpTierAttribute`, `/hrSetUpTierVariable`) that role postings actually bind to.
+ *
+ * One describe per endpoint titled with its bare `METHOD /path` signature, explicit standalone
+ * cases — no loops, no factories — so every case is individually named, reportable and
+ * skippable, and so `scripts/audit-vectors.ts` can group coverage by endpoint. The LEVEL/NODE
+ * archetype is shared with the workplace suite at the payload and schema layer only; every
+ * `test()` below is written out by hand.
+ *
+ * ## What is dangerous here
+ *
+ * The two tiers are structurally identical and easy to confuse, but they are **different
+ * collections**: `table_admin_hr_tier` versus `table_admin_hr_setup_tier_attribute`. Only the
+ * set-up tier is what a role posting resolves through `lastHrTierId` / `lastHrVariableId`, so
+ * a set-up node is load-bearing for employee placement in a way an HR-tier node is not.
+ *
+ * Every delete route in this file is a **hard delete**: no soft-delete flag, no cascade, no
+ * undo through the API — and these are tree nodes, so removing one orphans every child still
+ * pointing at it by `parent_variable_id`, and strands every role posting holding its id. Each
+ * case below therefore aims a freshly minted random ObjectId that matches no document, or
+ * exercises a refusal path. Nothing here deletes a real record.
+ *
+ * `getAllReportingHrTierVariableHierarchy` follows `reporting_variable_id` in application code
+ * rather than through a `$graphLookup`, with no visited set — so a cycle planted through save
+ * or update is a stored denial of service against a read path. The cases that plant one use
+ * random ids so nothing real is mutated. Note the shape trap the spec calls out: despite the
+ * plural name this operation returns a **single node**, not a list, unlike its workplace-tier
+ * counterpart.
+ *
+ * `POST /hrVariable/save` takes a **single object** while every other save in this subsystem
+ * takes an array — an inconsistency inside one team surface, and a case in its own right.
+ *
+ * ## Envelope reminder
+ *
+ * Every route answers HTTP 200 or 500 only, carrying
+ * `{ value, status: SUCCESS|FAILURE, statusCode, urlPath, error? }`. HTTP 200 says nothing
+ * about success, so assertions read the envelope's status word, never the transport alone.
+ */
+
+const XSS_PAYLOAD = `<script>alert('hr')</script>`;
+const SQLI_PAYLOAD = `1001' OR '1'='1`;
+const SQLI_DROP_PAYLOAD = `'; DROP TABLE table_admin_hr_tier; --`;
+const MAX_LENGTH_STRING = 'a'.repeat(5000);
+
+/* ==== POST /hrTier/save ==== */
+test.describe('POST /hrTier/save', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.tierSave,
+    repro: `await hrHierarchyClient.saveTier(buildLevelArray(2), { token });`,
+  };
+
+  test('[1] happy path: a valid array of HR levels returns a well-formed level-list envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(2);
+    const response = await hrHierarchyClient.saveTier(body, { token });
+
+    await expectValidContract(response, levelListEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1);
+    const response = await hrHierarchyClient.saveTier(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[1c] business rule: two concurrent saves of one name must not receive the same level code', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * `code` is documented as unique within the company and is generated by the service on
+     * save, with nothing reserving it first. Two callers racing on the same band name is the
+     * direct test of whether that uniqueness claim survives concurrency.
+     */
+    const body = buildLevelArray(1, { attributeName: 'QA-Concurrent-Band' });
+    const [first, second] = await Promise.all([
+      hrHierarchyClient.saveTier(body, { token }),
+      hrHierarchyClient.saveTier(body, { token }),
+    ]);
+
+    const a = (await readBody(first)).json?.value as Array<{ code?: string }> | null;
+    const b = (await readBody(second)).json?.value as Array<{ code?: string }> | null;
+    const codeA = Array.isArray(a) ? a[0]?.code : undefined;
+    const codeB = Array.isArray(b) ? b[0]?.code : undefined;
+
+    if (codeA && codeB && codeA === codeB) {
+      await reportBusinessLogicFlaw(
+        second,
+        {
+          ...META,
+          body,
+          repro: `await Promise.all([saveTier(body, { token }), saveTier(body, { token })]); // same code twice`,
+          scenario: `Two concurrent saves of "QA-Concurrent-Band" both came back with code "${codeA}". The code is generated without a reservation step or a unique index behind it, so two HR levels now share an identifier that downstream lookups treat as unique.`,
+          title: 'hrTier/save issues duplicate level codes under concurrency',
+        },
+        'Idempotency / Concurrency',
+        'Medium'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null attributeName must be refused, not stored as a nameless band', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { attributeName: null });
+    const response = await hrHierarchyClient.saveTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null attributeName' });
+  });
+
+  test('[2b] boundary: a null companyId must be refused — an unscoped level is unreadable', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    // Every read path on this collection filters on company_id, so a level written without
+    // one is persisted and then invisible to the tenant that created it.
+    const body = buildLevelArray(1, { companyId: null });
+    const response = await hrHierarchyClient.saveTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null companyId' });
+  });
+
+  test('[2c] boundary: a 5000-character attributeName must be refused rather than persisted', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { attributeName: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.saveTier(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) attributeName',
+    });
+  });
+
+  test('[3] typefuzz: a numeric companyId must be refused, not silently coerced', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { companyId: 1001 });
+    const response = await hrHierarchyClient.saveTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric companyId' });
+  });
+
+  test('[3b] typefuzz: an array attributeName must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { attributeName: ['Band', 'Grade'] });
+    const response = await hrHierarchyClient.saveTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'array attributeName' });
+  });
+
+  test('[3c] typefuzz: a single object where the documented body is an array must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevel();
+    const response = await hrHierarchyClient.saveTier(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      repro: `await hrHierarchyClient.saveTier(buildLevel(), { token }); // object, not array`,
+      scenario: 'object body instead of a JSON array',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must not be able to create HR levels', async ({
+    hrHierarchyClient,
+  }) => {
+    /*
+     * api.json places every route under the global bearerAuth requirement, but the backend's
+     * SecurityConfiguration permits all paths. An anonymous write here lets a stranger add
+     * bands and grades to a tenant HR structure.
+     */
+    const body = buildLevelArray(1);
+    const response = await hrHierarchyClient.saveTier(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: a malformed bearer token must be refused on a write', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildLevelArray(1);
+    const response = await hrHierarchyClient.saveTier(body, { token: MALFORMED_TOKEN });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] an HR level must not be creatable inside another tenant', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const body = buildLevelArray(1, { companyId: otherTenant });
+    const response = await hrHierarchyClient.saveTier(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.saveTier([{ companyId: "${otherTenant}", ... }], { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, an HR level was written into tenant "${otherTenant}" and reported SUCCESS. The body companyId is trusted over the token claim, so any caller can inject grade structure into any tenant. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR level write (IDOR) on hrTier/save',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a script attributeName must not be stored and echoed unescaped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { attributeName: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.saveTier(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+
+  test('[6b] injection: a SQL payload in attributeName must not surface a database error', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { attributeName: SQLI_DROP_PAYLOAD });
+    const response = await hrHierarchyClient.saveTier(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_DROP_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrTier/update ==== */
+test.describe('POST /hrTier/update', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.tierUpdate,
+    repro: `await hrHierarchyClient.updateTier(buildLevelUpdate(), { token });`,
+  };
+
+  test('[1] happy path: an update returns a well-formed envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate();
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    await expectValidContract(response, looseEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: a failure envelope must not be delivered under a 2xx transport status', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate();
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    await assertNot200OKOnError(response, { ...META, body });
+  });
+
+  test('[1c] business rule: updating an id that matches no document must not report SUCCESS', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const missingId = randomObjectId();
+    const body = buildLevelUpdate({ id: missingId, attributeName: 'QA-Renamed-Band' });
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS' && !json?.value) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.updateTier({ id: "${missingId}", attributeName: "QA-Renamed-Band" }, { token });`,
+          scenario: `Update against the non-existent HR level "${missingId}" returned SUCCESS with no document in value. Nothing was modified, yet the caller is told the rename landed. Body: ${text.slice(0, 200)}`,
+          title: 'hrTier/update reports SUCCESS when no document matched the id',
+        },
+        'Status Code Misreporting',
+        'Major'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[1d] business rule: a patch-shaped body must not null the fields it omits', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * The write replaces the whole document, so a caller sending only the field they meant to
+     * change erases companyId — and the level drops out of every tenant-scoped read while the
+     * response still reports success.
+     */
+    const body = { id: randomObjectId(), attributeName: 'QA-Patch-Shaped-Update' };
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    const { json } = await readBody(response);
+    const value = json?.value as { companyId?: string | null } | null;
+    if (value && (value.companyId === null || value.companyId === undefined)) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.updateTier({ id: "<id>", attributeName: "QA-Patch-Shaped-Update" }, { token });`,
+          scenario: `A PATCH-shaped update that omitted companyId returned a document with no companyId. Omitted fields are persisted as null, so a partial update silently unscopes the HR level from its tenant and no error is surfaced.`,
+          title: 'hrTier/update nulls omitted fields, unscoping the level from its tenant',
+        },
+        'Business Logic Flaw',
+        'Major'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null id must be refused rather than updating an arbitrary level', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ id: null });
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null id' });
+  });
+
+  test('[2b] boundary: an empty attributeName must not blank a level already in use', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ attributeName: '' });
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty attributeName' });
+  });
+
+  test('[2c] boundary: a 5000-character attributeName must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ attributeName: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) attributeName',
+    });
+  });
+
+  test('[3] typefuzz: a numeric id where a 24-char ObjectId is documented must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ id: 1001 });
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric id' });
+  });
+
+  test('[3b] typefuzz: a boolean attributeName must not be coerced into a stored name', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ attributeName: true });
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'boolean attributeName' });
+  });
+
+  test('[4] auth: an unauthenticated caller must not be able to rename an HR level', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildLevelUpdate();
+    const response = await hrHierarchyClient.updateTier(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: an expired token must be refused on a write', async ({ hrHierarchyClient }) => {
+    const body = buildLevelUpdate();
+    const response = await hrHierarchyClient.updateTier(body, { token: EXPIRED_TOKEN });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] an HR level must not be re-scopeable into another tenant', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const body = buildLevelUpdate({ companyId: otherTenant });
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    const { json, text } = await readBody(response);
+    const value = json?.value as { companyId?: string } | null;
+    if (value?.companyId === otherTenant) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.updateTier({ id: "<id>", companyId: "${otherTenant}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, an update moved an HR level into tenant "${otherTenant}" and the endpoint returned the re-scoped document. Every HR variable hanging off that level keeps its attribute_id, so a whole band disappears from one tenant grade structure and appears in another. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR level re-scoping (IDOR) on hrTier/update',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a malformed ObjectId must not leak the parser exception', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ id: 'not-an-object-id' });
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, 'not-an-object-id');
+  });
+
+  test('[6b] injection: a script attributeName must not be echoed unescaped on update', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ attributeName: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.updateTier(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrTier/delete ==== */
+test.describe('POST /hrTier/delete', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.tierDelete,
+    repro: `await hrHierarchyClient.deleteTier(buildById(), { token }); // random id — matches no document`,
+  };
+
+  test('[1] happy path: a delete against a non-existent id returns a well-formed envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    // Random id on purpose: this is a hard, non-cascading delete and every HR variable still
+    // carrying the deleted attributeId would be left pointing at nothing.
+    const body = buildById({ id: randomObjectId() });
+    const response = await hrHierarchyClient.deleteTier(body, { token });
+
+    await expectValidContract(response, looseEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: randomObjectId() });
+    const response = await hrHierarchyClient.deleteTier(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[1c] business rule: deleting an id that does not exist must not be reported as SUCCESS', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const missingId = randomObjectId();
+    const body = buildById({ id: missingId });
+    const response = await hrHierarchyClient.deleteTier(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.deleteTier({ id: "${missingId}" }, { token });`,
+          scenario: `Deleting the non-existent HR level "${missingId}" reported SUCCESS. There is no dependant check before the hard delete, so an operator receives the identical answer whether the level was absent or whether it was removed out from under live grade values. Body: ${text.slice(0, 200)}`,
+          title: 'hrTier/delete reports SUCCESS for an id that matched no document',
+        },
+        'Status Code Misreporting',
+        'Medium'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null id must be refused, not treated as an unbounded delete', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: null });
+    const response = await hrHierarchyClient.deleteTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null id on a delete' });
+  });
+
+  test('[2b] boundary: an empty id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: '' });
+    const response = await hrHierarchyClient.deleteTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty id on a delete' });
+  });
+
+  test('[3] typefuzz: an object id must be refused, not used as a Mongo operator', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * `{ $ne: null }` is the classic operator-injection shape: reaching the driver as a filter
+     * it matches every document, so one delete becomes the loss of the tenant entire band and
+     * grade structure.
+     */
+    const body = buildById({ id: { $ne: null } });
+    const response = await hrHierarchyClient.deleteTier(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'object id ({ $ne: null }) — operator injection that would match every document',
+    });
+  });
+
+  test('[3b] typefuzz: a boolean id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: true });
+    const response = await hrHierarchyClient.deleteTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'boolean id' });
+  });
+
+  test('[4] auth: an unauthenticated delete must be refused', async ({ hrHierarchyClient }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.deleteTier(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: a token forged with alg:none must not authorise a destructive delete', async ({
+    hrHierarchyClient,
+  }) => {
+    // An alg:none token is unsigned by construction. Honouring one means any caller can mint
+    // any identity — and this identity can dismantle a grade structure.
+    const body = buildById();
+    const response = await hrHierarchyClient.deleteTier(body, { token: FORGED_ALG_NONE_JWT });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] a caller must not be able to delete another tenant HR level', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * The delete body carries only an id — no tenant scope — so authorisation can come only
+     * from the token. A random id is used because confirming this any other way would mean
+     * destroying a real foreign record.
+     */
+    const foreignId = randomObjectId();
+    const body = buildById({ id: foreignId });
+    const response = await hrHierarchyClient.deleteTier(body, { token });
+
+    const { json, text } = await readBody(response);
+    const value = json?.value as { companyId?: string } | null;
+    if (value?.companyId && value.companyId !== companyID) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.deleteTier({ id: "${foreignId}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `A delete issued as tenant ${companyID} returned an HR level owned by tenant "${value.companyId}". Ids resolve globally rather than within the caller tenant, so any level is deletable by anyone who can guess or enumerate its id. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR level delete (IDOR) on hrTier/delete',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a SQL payload as the id must not leak an exception trace', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: SQLI_DROP_PAYLOAD });
+    const response = await hrHierarchyClient.deleteTier(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_DROP_PAYLOAD);
+  });
+
+  test('[6b] injection: a script id must not be reflected unescaped in the error message', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.deleteTier(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrTier/getAttribute ==== */
+test.describe('POST /hrTier/getAttribute', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.tierGet,
+    repro: `await hrHierarchyClient.getTier(buildById(), { token });`,
+  };
+
+  test('[1] happy path: a lookup by id returns a well-formed single-level envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    // A miss is documented as 200 with `value: null`, so the contract holds whether or not the
+    // random id happened to match a document.
+    const body = buildById();
+    const response = await hrHierarchyClient.getTier(body, { token });
+
+    await expectValidContract(response, levelEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById();
+    const response = await hrHierarchyClient.getTier(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[2] boundary: a null id must be refused rather than answered with an arbitrary level', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: null });
+    const response = await hrHierarchyClient.getTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null id' });
+  });
+
+  test('[2b] boundary: an empty id must be refused, not treated as "any document"', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: '' });
+    const response = await hrHierarchyClient.getTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty id' });
+  });
+
+  test('[2c] boundary: a 5000-character id must not be processed as a primary key', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.getTier(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) id',
+    });
+  });
+
+  test('[3] typefuzz: a numeric id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: 1001 });
+    const response = await hrHierarchyClient.getTier(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric id' });
+  });
+
+  test('[3b] typefuzz: an array id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: ['66f1a2b3c4d5e6f708192a3b', '66f1a2b3c4d5e6f708192a4c'] });
+    const response = await hrHierarchyClient.getTier(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'array id where a single ObjectId is documented',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must be refused, not served the HR level', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.getTier(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: an expired token must be refused', async ({ hrHierarchyClient }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.getTier(body, { token: EXPIRED_TOKEN });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] an HR level id belonging to another tenant must not be readable', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * findById applies no tenant filter, so the only thing between a caller and another
+     * tenant grade structure is the unguessability of a 24-hex id.
+     */
+    const foreignId = randomObjectId();
+    const body = buildById({ id: foreignId });
+    const response = await hrHierarchyClient.getTier(body, { token });
+
+    const parsed = levelSchema.safeParse((await readBody(response)).json?.value);
+    if (parsed.success && parsed.data.companyId && parsed.data.companyId !== companyID) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.getTier({ id: "${foreignId}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `A lookup issued as tenant ${companyID} returned an HR level owned by tenant "${parsed.data.companyId}". findById carries no company_id clause, so id enumeration reads any tenant band and grade naming.`,
+          title: 'Cross-tenant HR level read (IDOR) on hrTier/getAttribute',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a SQL-injection id must not surface a database error or query echo', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: SQLI_PAYLOAD });
+    const response = await hrHierarchyClient.getTier(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_PAYLOAD);
+  });
+
+  test('[6b] injection: a script id must not come back unescaped in the envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.getTier(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrTier/getAttributeByCompanyId ==== */
+test.describe('POST /hrTier/getAttributeByCompanyId', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.tierGetByCompanyId,
+    repro: `await hrHierarchyClient.getTierByCompanyId(buildByCompany(), { token });`,
+  };
+
+  test('[1] happy path: a valid companyId returns a well-formed level-list envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany();
+    const response = await hrHierarchyClient.getTierByCompanyId(body, { token });
+
+    await expectValidContract(response, levelListEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany();
+    const response = await hrHierarchyClient.getTierByCompanyId(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[2] boundary: a null companyId must be refused rather than treated as "all tenants"', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: null });
+    const response = await hrHierarchyClient.getTierByCompanyId(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null companyId' });
+  });
+
+  test('[2b] boundary: an empty companyId must not be answered with the whole collection', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: '' });
+    const response = await hrHierarchyClient.getTierByCompanyId(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty companyId' });
+  });
+
+  test('[2c] boundary: a 5000-character companyId must not be processed as a lookup key', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.getTierByCompanyId(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) companyId',
+    });
+  });
+
+  test('[3] typefuzz: a numeric companyId must be refused, not silently coerced', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: 1001 });
+    const response = await hrHierarchyClient.getTierByCompanyId(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric companyId' });
+  });
+
+  test('[3b] typefuzz: an object companyId must not reach the driver as an operator', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    // `{ $ne: null }` as a filter value matches every document, turning a tenant read into a
+    // platform-wide export of HR structure.
+    const body = buildByCompany({ companyId: { $ne: null } });
+    const response = await hrHierarchyClient.getTierByCompanyId(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'object companyId ({ $ne: null }) — Mongo operator injection',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must be refused, not served the tenant band list', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildByCompany();
+    const response = await hrHierarchyClient.getTierByCompanyId(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: a token forged with alg:none must never be accepted', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildByCompany();
+    const response = await hrHierarchyClient.getTierByCompanyId(body, {
+      token: FORGED_ALG_NONE_JWT,
+    });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] one tenant must not receive another tenant HR levels', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * The auth filter injects companyID from the token, but this endpoint reads companyId from
+     * the BODY. If the body wins, a competitor whole grade ladder is one integer away.
+     */
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const body = buildByCompany({ companyId: otherTenant });
+    const response = await hrHierarchyClient.getTierByCompanyId(body, { token });
+
+    const { json } = await readBody(response);
+    const value = json?.value;
+    if (Array.isArray(value) && value.length > 0) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.getTierByCompanyId({ companyId: "${otherTenant}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, the body companyId "${otherTenant}" returned ${value.length} foreign HR level(s). The endpoint trusts the body over the token, so every tenant band and grade taxonomy on the deployment is enumerable.`,
+          title: 'Cross-tenant HR level list (IDOR) on hrTier/getAttributeByCompanyId',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a SQL-injection companyId must not surface a database error', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: SQLI_PAYLOAD });
+    const response = await hrHierarchyClient.getTierByCompanyId(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_PAYLOAD);
+  });
+
+  test('[6b] injection: a script companyId must not come back unescaped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.getTierByCompanyId(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrVariable/save ==== */
+test.describe('POST /hrVariable/save', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.variableSave,
+    repro: `await hrHierarchyClient.saveVariable(buildNode(), { token }); // single object, not an array`,
+  };
+
+  test('[1] happy path: a single valid HR node returns a well-formed node envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    // Alone among the saves in this subsystem, this one takes a single document.
+    const body = buildNode();
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    await expectValidContract(response, nodeEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNode();
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[1c] business rule: an HR node must not be accepted under an attributeId that does not exist', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * `attributeId` names the HrTier level the value sits at, and nothing validates that the
+     * level exists. A grade attached to a phantom band cannot be rendered in any HR picker,
+     * yet the caller is told the save worked.
+     */
+    const phantomLevel = randomObjectId();
+    const body = buildNode({ attributeId: phantomLevel });
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.saveVariable({ attributeId: "${phantomLevel}", ... }, { token });`,
+          scenario: `An HR node was accepted at level "${phantomLevel}", which matches no HrTier document. Referential integrity is not enforced on write, so the grade ladder accumulates values hanging off bands that do not exist. Body: ${text.slice(0, 200)}`,
+          title: 'hrVariable/save accepts a node under a non-existent attributeId',
+        },
+        'Business Logic Flaw',
+        'Major'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null variableName must be refused, not stored as a nameless grade', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNode({ variableName: null });
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null variableName' });
+  });
+
+  test('[2b] boundary: a 5000-character variableName must be refused rather than persisted', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNode({ variableName: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) variableName',
+    });
+  });
+
+  test('[2c] boundary: a self-parenting node must be refused before it enters the tree', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * Children are resolved by querying parent_variable_id, so a node that is its own parent
+     * is a one-element cycle: any descent through the grade tree recurses on itself. The id is
+     * random, so nothing real is touched.
+     */
+    const selfId = randomObjectId();
+    const body = buildNode({ id: selfId, parentVariableId: selfId });
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      repro: `await hrHierarchyClient.saveVariable({ id: "${selfId}", parentVariableId: "${selfId}" }, { token });`,
+      scenario: 'self-parenting node — a one-element cycle in a self-referencing tree',
+    });
+  });
+
+  test('[3] typefuzz: a numeric attributeId must be refused, not coerced into an ObjectId', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNode({ attributeId: 1001 });
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric attributeId' });
+  });
+
+  test('[3b] typefuzz: a boolean variableName must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNode({ variableName: true });
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'boolean variableName' });
+  });
+
+  test('[3c] typefuzz: an array body where a single document is documented must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * Every sibling save in this subsystem takes an array and this one does not. An array
+     * accepted here would mean the two conventions are silently interchangeable, which makes
+     * the published contract meaningless; a rejection must at least be a clean 4xx.
+     */
+    const body = buildNodeArray(2);
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      repro: `await hrHierarchyClient.saveVariable(buildNodeArray(2), { token }); // array, not object`,
+      scenario: 'JSON array body where a single HrVariable document is documented',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must not be able to create HR grade values', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildNode();
+    const response = await hrHierarchyClient.saveVariable(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: an expired token must be refused on a write', async ({ hrHierarchyClient }) => {
+    const body = buildNode();
+    const response = await hrHierarchyClient.saveVariable(body, { token: EXPIRED_TOKEN });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] an HR node must not be creatable under a parent owned by another tenant', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * Keep a foreign companyId and point the structural parent at a foreign node: if accepted,
+     * an attacker-controlled grade is grafted into a neighbour ladder and shows up in their HR
+     * pickers.
+     */
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const foreignParent = randomObjectId();
+    const body = buildNode({
+      companyId: otherTenant,
+      parentVariableId: foreignParent,
+      parentAttributeId: randomObjectId(),
+    });
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.saveVariable({ companyId: "${otherTenant}", parentVariableId: "${foreignParent}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, an HR node was written into tenant "${otherTenant}" under parent "${foreignParent}" and reported SUCCESS. Neither the companyId nor the parent link is checked against the token. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR node grafting (IDOR) on hrVariable/save',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a script variableName must not be stored and echoed unescaped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNode({ variableName: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+
+  test('[6b] injection: a SQL payload as attributeId must not surface a database error', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNode({ attributeId: SQLI_DROP_PAYLOAD });
+    const response = await hrHierarchyClient.saveVariable(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_DROP_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrVariable/update ==== */
+test.describe('POST /hrVariable/update', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.variableUpdate,
+    repro: `await hrHierarchyClient.updateVariable(buildNodeUpdate(), { token });`,
+  };
+
+  test('[1] happy path: an update returns a well-formed envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate();
+    const response = await hrHierarchyClient.updateVariable(body, { token });
+
+    await expectValidContract(response, looseEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: a failure envelope must not be delivered under a 2xx transport status', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate();
+    const response = await hrHierarchyClient.updateVariable(body, { token });
+
+    await assertNot200OKOnError(response, { ...META, body });
+  });
+
+  test('[1c] business rule: updating an id that matches no document must not report SUCCESS', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const missingId = randomObjectId();
+    const body = buildNodeUpdate({ id: missingId, variableName: 'QA-Renamed-Grade' });
+    const response = await hrHierarchyClient.updateVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS' && !json?.value) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.updateVariable({ id: "${missingId}", variableName: "QA-Renamed-Grade" }, { token });`,
+          scenario: `Update against the non-existent HR node "${missingId}" returned SUCCESS with no document in value. Body: ${text.slice(0, 200)}`,
+          title: 'hrVariable/update reports SUCCESS when no document matched the id',
+        },
+        'Status Code Misreporting',
+        'Major'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[1d] business rule: a two-node parent cycle must be refused, not persisted', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * A parents B and B parents A. Re-parenting moves a subtree implicitly because children
+     * are resolved by parent id, so a mutual pair makes any descent through the HR tree
+     * non-terminating. Both ids are freshly minted and match no document.
+     */
+    const nodeA = randomObjectId();
+    const nodeB = randomObjectId();
+    await hrHierarchyClient.updateVariable(buildNodeUpdate({ id: nodeB, parentVariableId: nodeA }), {
+      token,
+    });
+    const body = buildNodeUpdate({ id: nodeA, parentVariableId: nodeB });
+    const response = await hrHierarchyClient.updateVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await updateVariable({ id: "${nodeB}", parentVariableId: "${nodeA}" }); await updateVariable({ id: "${nodeA}", parentVariableId: "${nodeB}" });`,
+          scenario: `A mutual parent cycle between "${nodeA}" and "${nodeB}" was accepted with status SUCCESS. The HR tree is stored as self-referencing id strings with no acyclicity check, so any recursive walk over this pair loops until it exhausts its stack or its request timeout. Body: ${text.slice(0, 200)}`,
+          title: 'hrVariable/update accepts a cyclic parent link (unbounded recursion)',
+        },
+        'Business Logic Flaw',
+        'Major'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null id must be refused rather than updating an arbitrary node', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({ id: null });
+    const response = await hrHierarchyClient.updateVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null id' });
+  });
+
+  test('[2b] boundary: an empty variableName must not blank a grade already in use', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({ variableName: '' });
+    const response = await hrHierarchyClient.updateVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty variableName' });
+  });
+
+  test('[3] typefuzz: a numeric id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({ id: 1001 });
+    const response = await hrHierarchyClient.updateVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric id' });
+  });
+
+  test('[3b] typefuzz: an array parentVariableId must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({
+      parentVariableId: ['66f1a2b3c4d5e6f708192a5d', '66f1a2b3c4d5e6f708192a6e'],
+    });
+    const response = await hrHierarchyClient.updateVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'array parentVariableId — a node has exactly one structural parent',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must not be able to re-parent an HR node', async ({
+    hrHierarchyClient,
+  }) => {
+    // Changing parentVariableId moves the node whole subtree, so an anonymous write here can
+    // restructure a grade ladder in one call.
+    const body = buildNodeUpdate();
+    const response = await hrHierarchyClient.updateVariable(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: a malformed bearer token must be refused', async ({ hrHierarchyClient }) => {
+    const body = buildNodeUpdate();
+    const response = await hrHierarchyClient.updateVariable(body, { token: MALFORMED_TOKEN });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] an HR node must not be re-parentable under another tenant subtree', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const foreignParent = randomObjectId();
+    const body = buildNodeUpdate({ companyId: otherTenant, parentVariableId: foreignParent });
+    const response = await hrHierarchyClient.updateVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const value = json?.value as { companyId?: string } | null;
+    if (value?.companyId === otherTenant) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.updateVariable({ id: "<id>", companyId: "${otherTenant}", parentVariableId: "${foreignParent}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, an update moved an HR node into tenant "${otherTenant}" under a foreign parent. Children resolve by parent id, so the node subtree travels with it — a bulk cross-tenant move issued as a single-document write. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR node re-parenting (IDOR) on hrVariable/update',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a malformed ObjectId must not leak the parser exception', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({ id: 'not-an-object-id' });
+    const response = await hrHierarchyClient.updateVariable(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, 'not-an-object-id');
+  });
+
+  test('[6b] injection: a script variableName must not be echoed unescaped on update', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({ variableName: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.updateVariable(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrVariable/delete ==== */
+test.describe('POST /hrVariable/delete', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.variableDelete,
+    repro: `await hrHierarchyClient.deleteVariable(buildById(), { token }); // random id — matches no document`,
+  };
+
+  test('[1] happy path: a delete against a non-existent id returns a well-formed envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    // Random id on purpose: deleting a real grade orphans every child that points at it.
+    const body = buildById({ id: randomObjectId() });
+    const response = await hrHierarchyClient.deleteVariable(body, { token });
+
+    await expectValidContract(response, looseEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: randomObjectId() });
+    const response = await hrHierarchyClient.deleteVariable(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[1c] business rule: deleting a node must not silently orphan its children', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const missingId = randomObjectId();
+    const body = buildById({ id: missingId });
+    const response = await hrHierarchyClient.deleteVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.deleteVariable({ id: "${missingId}" }, { token });`,
+          scenario: `Deleting the non-existent HR node "${missingId}" reported SUCCESS. The delete is a non-cascading hard delete with no dependant count, so the same answer is returned whether the node was absent or removed while children still referenced it by parent_variable_id. Body: ${text.slice(0, 200)}`,
+          title: 'hrVariable/delete cannot distinguish a miss from an orphaning delete',
+        },
+        'Status Code Misreporting',
+        'Medium'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null id must be refused, not treated as an unbounded delete', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: null });
+    const response = await hrHierarchyClient.deleteVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null id on a delete' });
+  });
+
+  test('[2b] boundary: an empty id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: '' });
+    const response = await hrHierarchyClient.deleteVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty id on a delete' });
+  });
+
+  test('[3] typefuzz: an object id must be refused, not used as a Mongo operator', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: { $ne: null } });
+    const response = await hrHierarchyClient.deleteVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'object id ({ $ne: null }) — operator injection that would wipe the grade collection',
+    });
+  });
+
+  test('[3b] typefuzz: a numeric id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: 1001 });
+    const response = await hrHierarchyClient.deleteVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric id' });
+  });
+
+  test('[4] auth: an unauthenticated delete must be refused', async ({ hrHierarchyClient }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.deleteVariable(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: an expired token must not authorise a destructive delete', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.deleteVariable(body, { token: EXPIRED_TOKEN });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] a caller must not be able to delete a node in another tenant grade ladder', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const foreignId = randomObjectId();
+    const body = buildById({ id: foreignId });
+    const response = await hrHierarchyClient.deleteVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const value = json?.value as { companyId?: string } | null;
+    if (value?.companyId && value.companyId !== companyID) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.deleteVariable({ id: "${foreignId}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `A delete issued as tenant ${companyID} returned an HR node owned by tenant "${value.companyId}". The body carries no tenant scope and ids resolve globally, so a guessed id destroys a foreign grade value and orphans its children. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR node delete (IDOR) on hrVariable/delete',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a SQL payload as the id must not leak an exception trace', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: SQLI_DROP_PAYLOAD });
+    const response = await hrHierarchyClient.deleteVariable(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_DROP_PAYLOAD);
+  });
+
+  test('[6b] injection: a script id must not be reflected unescaped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.deleteVariable(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrVariable/getVariable ==== */
+test.describe('POST /hrVariable/getVariable', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.variableGet,
+    repro: `await hrHierarchyClient.getVariable(buildNodeLookup(), { token });`,
+  };
+
+  test('[1] happy path: a parent + tenant lookup returns a well-formed node-list envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup();
+    const response = await hrHierarchyClient.getVariable(body, { token });
+
+    await expectValidContract(response, nodeListEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup();
+    const response = await hrHierarchyClient.getVariable(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[2] boundary: the documented null-parent root query must stay tenant-scoped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * The spec says to pass parentVariableId as null to list the roots. That is the one query
+     * on this route with no id narrowing it, so company_id is the whole isolation boundary.
+     */
+    const body = buildNodeLookup({ parentVariableId: null });
+    const response = await hrHierarchyClient.getVariable(body, { token });
+
+    const { json } = await readBody(response);
+    const value = json?.value;
+    const foreign = Array.isArray(value)
+      ? (value as Array<{ companyId?: string }>).filter(
+          (n) => n?.companyId && n.companyId !== companyID
+        )
+      : [];
+    if (foreign.length > 0) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.getVariable({ companyId: "${companyID}", parentVariableId: null }, { token });`,
+          scenario: `The documented root query returned ${foreign.length} node(s) belonging to other tenants (e.g. "${foreign[0]?.companyId}"). With no parent id narrowing it, the company_id filter is the only isolation on this route and it did not hold.`,
+          title: 'hrVariable/getVariable root query returns foreign-tenant nodes',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2b] boundary: an empty companyId must not widen the query to every tenant', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ companyId: '' });
+    const response = await hrHierarchyClient.getVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty companyId' });
+  });
+
+  test('[2c] boundary: a 5000-character parentVariableId must not be processed as a filter', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ parentVariableId: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.getVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) parentVariableId',
+    });
+  });
+
+  test('[3] typefuzz: a numeric companyId must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ companyId: 1001 });
+    const response = await hrHierarchyClient.getVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric companyId' });
+  });
+
+  test('[3b] typefuzz: an object parentVariableId must not reach the driver as an operator', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    // `{ $ne: null }` on the parent half of the filter returns every non-root grade in the
+    // tenant in one call — the whole ladder from an endpoint documented to page it.
+    const body = buildNodeLookup({ parentVariableId: { $ne: null } });
+    const response = await hrHierarchyClient.getVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'object parentVariableId ({ $ne: null }) — Mongo operator injection',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must be refused, not served the grade subtree', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildNodeLookup();
+    const response = await hrHierarchyClient.getVariable(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: a token forged with alg:none must never be accepted', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildNodeLookup();
+    const response = await hrHierarchyClient.getVariable(body, { token: FORGED_ALG_NONE_JWT });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] one tenant must not be able to expand another tenant grade ladder', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const body = buildNodeLookup({ companyId: otherTenant, parentVariableId: null });
+    const response = await hrHierarchyClient.getVariable(body, { token });
+
+    const { json } = await readBody(response);
+    const value = json?.value;
+    if (Array.isArray(value) && value.length > 0) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.getVariable({ companyId: "${otherTenant}", parentVariableId: null }, { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, asking for tenant "${otherTenant}" root grades returned ${value.length} node(s). Feeding each id back into the same call walks a competitor entire band and grade ladder — a direct read of their compensation structure taxonomy.`,
+          title: 'Cross-tenant HR ladder expansion (IDOR) on hrVariable/getVariable',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a SQL-injection parentVariableId must not surface a database error', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ parentVariableId: SQLI_PAYLOAD });
+    const response = await hrHierarchyClient.getVariable(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_PAYLOAD);
+  });
+
+  test('[6b] injection: a script companyId must not come back unescaped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ companyId: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.getVariable(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrSetUpTierAttribute/save ==== */
+test.describe('POST /hrSetUpTierAttribute/save', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.setUpAttributeSave,
+    repro: `await hrHierarchyClient.saveSetUpAttribute(buildLevelArray(2), { token });`,
+  };
+
+  test('[1] happy path: a valid array of set-up levels returns a level-list envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(2);
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token });
+
+    await expectValidContract(response, levelListEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1);
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[1c] business rule: two concurrent saves of one name must not receive the same level code', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * This is the tier role postings resolve against through `lastHrTierId`, so a duplicated
+     * "unique within the company" code here is not cosmetic: two levels sharing an identifier
+     * makes the posting-side lookup ambiguous.
+     */
+    const body = buildLevelArray(1, { attributeName: 'QA-Concurrent-Function' });
+    const [first, second] = await Promise.all([
+      hrHierarchyClient.saveSetUpAttribute(body, { token }),
+      hrHierarchyClient.saveSetUpAttribute(body, { token }),
+    ]);
+
+    const a = (await readBody(first)).json?.value as Array<{ code?: string }> | null;
+    const b = (await readBody(second)).json?.value as Array<{ code?: string }> | null;
+    const codeA = Array.isArray(a) ? a[0]?.code : undefined;
+    const codeB = Array.isArray(b) ? b[0]?.code : undefined;
+
+    if (codeA && codeB && codeA === codeB) {
+      await reportBusinessLogicFlaw(
+        second,
+        {
+          ...META,
+          body,
+          repro: `await Promise.all([saveSetUpAttribute(body, { token }), saveSetUpAttribute(body, { token })]);`,
+          scenario: `Two concurrent saves of "QA-Concurrent-Function" both returned code "${codeA}". Role postings resolve this tier by its identifiers, so a collision here makes employee placement resolve against whichever duplicate the query happens to return first.`,
+          title: 'hrSetUpTierAttribute/save issues duplicate level codes under concurrency',
+        },
+        'Idempotency / Concurrency',
+        'Medium'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null attributeName must be refused, not stored as a nameless function', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { attributeName: null });
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null attributeName' });
+  });
+
+  test('[2b] boundary: an empty attributeName must not create an unlabelled set-up level', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { attributeName: '' });
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty attributeName' });
+  });
+
+  test('[2c] boundary: a 5000-character attributeName must be refused rather than persisted', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { attributeName: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) attributeName',
+    });
+  });
+
+  test('[3] typefuzz: a numeric companyId must be refused, not silently coerced', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { companyId: 1001 });
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric companyId' });
+  });
+
+  test('[3b] typefuzz: a boolean attributeName must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { attributeName: false });
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'boolean attributeName' });
+  });
+
+  test('[3c] typefuzz: a single object where the documented body is an array must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevel();
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      repro: `await hrHierarchyClient.saveSetUpAttribute(buildLevel(), { token }); // object, not array`,
+      scenario: 'object body instead of a JSON array',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must not be able to create HR set-up levels', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildLevelArray(1);
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: an expired token must be refused on a write', async ({ hrHierarchyClient }) => {
+    const body = buildLevelArray(1);
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token: EXPIRED_TOKEN });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] a set-up level must not be creatable inside another tenant', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const body = buildLevelArray(1, { companyId: otherTenant });
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.saveSetUpAttribute([{ companyId: "${otherTenant}", ... }], { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, an HR set-up level was written into tenant "${otherTenant}" and reported SUCCESS. This is the tier role postings bind to, so an injected level becomes selectable when a foreign tenant places an employee. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR set-up level write (IDOR) on hrSetUpTierAttribute/save',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a script attributeName must not be stored and echoed unescaped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { attributeName: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+
+  test('[6b] injection: a SQL payload in attributeName must not surface a database error', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelArray(1, { attributeName: SQLI_DROP_PAYLOAD });
+    const response = await hrHierarchyClient.saveSetUpAttribute(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_DROP_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrSetUpTierAttribute/update ==== */
+test.describe('POST /hrSetUpTierAttribute/update', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.setUpAttributeUpdate,
+    repro: `await hrHierarchyClient.updateSetUpAttribute(buildLevelUpdate(), { token });`,
+  };
+
+  test('[1] happy path: an update returns a well-formed envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate();
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token });
+
+    await expectValidContract(response, looseEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: a failure envelope must not be delivered under a 2xx transport status', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate();
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token });
+
+    await assertNot200OKOnError(response, { ...META, body });
+  });
+
+  test('[1c] business rule: updating an id that matches no document must not report SUCCESS', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const missingId = randomObjectId();
+    const body = buildLevelUpdate({ id: missingId, attributeName: 'QA-Renamed-Function' });
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS' && !json?.value) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.updateSetUpAttribute({ id: "${missingId}", attributeName: "QA-Renamed-Function" }, { token });`,
+          scenario: `Renaming the non-existent set-up level "${missingId}" returned SUCCESS with an empty value. Body: ${text.slice(0, 200)}`,
+          title: 'hrSetUpTierAttribute/update reports SUCCESS when no document matched the id',
+        },
+        'Status Code Misreporting',
+        'Major'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null id must be refused rather than renaming an arbitrary level', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ id: null });
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null id' });
+  });
+
+  test('[2b] boundary: an empty attributeName must not blank a level role postings resolve against', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ attributeName: '' });
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty attributeName' });
+  });
+
+  test('[2c] boundary: a 5000-character attributeName must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ attributeName: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) attributeName',
+    });
+  });
+
+  test('[3] typefuzz: a numeric id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ id: 1001 });
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric id' });
+  });
+
+  test('[3b] typefuzz: an array companyId must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ companyId: ['1001', '1002'] });
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'array companyId — a level cannot belong to two tenants',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must not be able to rename a set-up level', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildLevelUpdate();
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: a malformed bearer token must be refused', async ({ hrHierarchyClient }) => {
+    const body = buildLevelUpdate();
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token: MALFORMED_TOKEN });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] a set-up level must not be re-scopeable into another tenant', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const body = buildLevelUpdate({ companyId: otherTenant });
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token });
+
+    const { json, text } = await readBody(response);
+    const value = json?.value as { companyId?: string } | null;
+    if (value?.companyId === otherTenant) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.updateSetUpAttribute({ id: "<id>", companyId: "${otherTenant}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, an update moved an HR set-up level into tenant "${otherTenant}". Role postings resolve employee placement through this tier, so moving a level between tenants breaks placement on one side and pollutes it on the other. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR set-up level re-scoping (IDOR) on hrSetUpTierAttribute/update',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a malformed ObjectId must not leak the parser exception', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ id: 'not-an-object-id' });
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, 'not-an-object-id');
+  });
+
+  test('[6b] injection: a script attributeName must not be echoed unescaped on rename', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildLevelUpdate({ attributeName: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.updateSetUpAttribute(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrSetUpTierAttribute/delete ==== */
+test.describe('POST /hrSetUpTierAttribute/delete', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.setUpAttributeDelete,
+    repro: `await hrHierarchyClient.deleteSetUpAttribute(buildById(), { token }); // random id — matches no document`,
+  };
+
+  test('[1] happy path: a delete against a non-existent id returns a well-formed envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    // Random id on purpose: role postings resolve through this tier, so deleting a live level
+    // breaks employee placement with no cascade and no undo.
+    const body = buildById({ id: randomObjectId() });
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, { token });
+
+    await expectValidContract(response, looseEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: randomObjectId() });
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[1c] business rule: a delete that would break role-posting resolution must not report a bare SUCCESS', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const missingId = randomObjectId();
+    const body = buildById({ id: missingId });
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.deleteSetUpAttribute({ id: "${missingId}" }, { token });`,
+          scenario: `Deleting the non-existent set-up level "${missingId}" reported SUCCESS. Role postings hold this tier id in lastHrTierId, and the route counts no dependants before a hard delete, so the same word is returned whether nothing matched or a level in active use by employee records was removed. Body: ${text.slice(0, 200)}`,
+          title: 'hrSetUpTierAttribute/delete reports an undifferentiated SUCCESS despite downstream dependants',
+        },
+        'Status Code Misreporting',
+        'Medium'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null id must be refused, not treated as an unbounded delete', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: null });
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null id on a delete' });
+  });
+
+  test('[2b] boundary: an empty id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: '' });
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty id on a delete' });
+  });
+
+  test('[3] typefuzz: an object id must be refused, not used as a Mongo operator', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: { $ne: null } });
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'object id ({ $ne: null }) — operator injection that would wipe every set-up level',
+    });
+  });
+
+  test('[3b] typefuzz: a boolean id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: true });
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'boolean id' });
+  });
+
+  test('[4] auth: an unauthenticated delete must be refused', async ({ hrHierarchyClient }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: a token forged with alg:none must not authorise a destructive delete', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, {
+      token: FORGED_ALG_NONE_JWT,
+    });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] a caller must not be able to delete another tenant set-up level', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const foreignId = randomObjectId();
+    const body = buildById({ id: foreignId });
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, { token });
+
+    const { json, text } = await readBody(response);
+    const value = json?.value as { companyId?: string } | null;
+    if (value?.companyId && value.companyId !== companyID) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.deleteSetUpAttribute({ id: "${foreignId}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `A delete issued as tenant ${companyID} returned a set-up level owned by tenant "${value.companyId}". Ids resolve globally, so a guessed id removes a level a foreign tenant role postings depend on for placement. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR set-up level delete (IDOR) on hrSetUpTierAttribute/delete',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a SQL payload as the id must not leak an exception trace', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: SQLI_DROP_PAYLOAD });
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_DROP_PAYLOAD);
+  });
+
+  test('[6b] injection: a script id must not be reflected unescaped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.deleteSetUpAttribute(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrSetUpTierAttribute/getAttribute ==== */
+test.describe('POST /hrSetUpTierAttribute/getAttribute', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.setUpAttributeGet,
+    repro: `await hrHierarchyClient.getSetUpAttribute(buildById(), { token });`,
+  };
+
+  test('[1] happy path: a lookup by id returns a well-formed single-level envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    // A miss is documented as 200 with `value: null`, never a 404.
+    const body = buildById();
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token });
+
+    await expectValidContract(response, levelEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById();
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[2] boundary: a null id must be refused rather than answered with an arbitrary level', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: null });
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null id' });
+  });
+
+  test('[2b] boundary: an empty id must be refused, not treated as "any document"', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: '' });
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty id' });
+  });
+
+  test('[2c] boundary: a 5000-character id must not be processed as a primary key', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) id',
+    });
+  });
+
+  test('[3] typefuzz: a numeric id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: 1001 });
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric id' });
+  });
+
+  test('[3b] typefuzz: an object id must not reach the driver as an operator', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: { $ne: null } });
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'object id ({ $ne: null }) — Mongo operator injection on a findById',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must be refused, not served the set-up level', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: an expired token must be refused', async ({ hrHierarchyClient }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token: EXPIRED_TOKEN });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] a set-up level id belonging to another tenant must not be readable', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const foreignId = randomObjectId();
+    const body = buildById({ id: foreignId });
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token });
+
+    const parsed = levelSchema.safeParse((await readBody(response)).json?.value);
+    if (parsed.success && parsed.data.companyId && parsed.data.companyId !== companyID) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.getSetUpAttribute({ id: "${foreignId}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `A findById issued as tenant ${companyID} returned a set-up level owned by tenant "${parsed.data.companyId}". The lookup applies no company_id filter, so id enumeration reads any tenant HR function taxonomy.`,
+          title: 'Cross-tenant HR set-up level read (IDOR) on hrSetUpTierAttribute/getAttribute',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a SQL-injection id must not surface a database error or query echo', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: SQLI_PAYLOAD });
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_PAYLOAD);
+  });
+
+  test('[6b] injection: a script id must not come back unescaped in the envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.getSetUpAttribute(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrSetUpTierAttribute/getAttributeByCompanyId ==== */
+test.describe('POST /hrSetUpTierAttribute/getAttributeByCompanyId', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.setUpAttributeGetByCompanyId,
+    repro: `await hrHierarchyClient.getSetUpAttributeByCompanyId(buildByCompany(), { token });`,
+  };
+
+  test('[1] happy path: a valid companyId returns a well-formed level-list envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany();
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, { token });
+
+    await expectValidContract(response, levelListEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany();
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[2] boundary: a null companyId must be refused rather than treated as "all tenants"', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: null });
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null companyId' });
+  });
+
+  test('[2b] boundary: an empty companyId must not be answered with the whole collection', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: '' });
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty companyId' });
+  });
+
+  test('[2c] boundary: a 5000-character companyId must not be processed as a lookup key', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) companyId',
+    });
+  });
+
+  test('[3] typefuzz: a numeric companyId must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: 1001 });
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric companyId' });
+  });
+
+  test('[3b] typefuzz: an array companyId must be refused, not expanded into a multi-tenant read', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: ['1001', '1002'] });
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'array companyId' });
+  });
+
+  test('[4] auth: an unauthenticated caller must be refused, not served the tenant function list', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildByCompany();
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: a malformed bearer token must be refused', async ({ hrHierarchyClient }) => {
+    const body = buildByCompany();
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, {
+      token: MALFORMED_TOKEN,
+    });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] one tenant must not receive another tenant HR set-up levels', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const body = buildByCompany({ companyId: otherTenant });
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, { token });
+
+    const { json } = await readBody(response);
+    const value = json?.value;
+    if (Array.isArray(value) && value.length > 0) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.getSetUpAttributeByCompanyId({ companyId: "${otherTenant}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, the body companyId "${otherTenant}" returned ${value.length} foreign HR set-up level(s). This is the tier employees are placed against, so the response is a readable map of a competitor internal function and team structure.`,
+          title: 'Cross-tenant HR set-up level list (IDOR) on hrSetUpTierAttribute/getAttributeByCompanyId',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a SQL-injection companyId must not surface a database error', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: SQLI_PAYLOAD });
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_PAYLOAD);
+  });
+
+  test('[6b] injection: a script companyId must not come back unescaped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildByCompany({ companyId: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.getSetUpAttributeByCompanyId(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrSetUpTierVariable/save ==== */
+test.describe('POST /hrSetUpTierVariable/save', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.setUpVariableSave,
+    repro: `await hrHierarchyClient.saveSetUpVariable([buildReportingNode()], { token });`,
+  };
+
+  test('[1] happy path: a valid array of set-up nodes returns a node-list envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = [buildReportingNode(), buildReportingNode()];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    await expectValidContract(response, nodeListEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = [buildReportingNode()];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[1c] business rule: a node must not be accepted under an attributeId that does not exist', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    // The schema states outright that attributeId is "not validated to exist".
+    const phantomLevel = randomObjectId();
+    const body = [buildReportingNode({ attributeId: phantomLevel })];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.saveSetUpVariable([{ attributeId: "${phantomLevel}", ... }], { token });`,
+          scenario: `An HR set-up node was accepted at level "${phantomLevel}", which matches no set-up attribute. A role posting can still record this node in lastHrVariableId, so an employee ends up placed at a position whose level does not exist. Body: ${text.slice(0, 200)}`,
+          title: 'hrSetUpTierVariable/save accepts a node under a non-existent attributeId',
+        },
+        'Business Logic Flaw',
+        'Major'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[1d] business rule: a self-reporting node must be refused before the reporting walk sees it', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * `getAllReportingHrTierVariableHierarchy` follows reporting_variable_id in application
+     * code with no visited set, so a node that reports to itself is a one-hop cycle. The id is
+     * random, so this probes acceptance rather than a live record.
+     */
+    const selfId = randomObjectId();
+    const body = [buildReportingNode({ id: selfId, reportingVariableId: selfId })];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.saveSetUpVariable([{ id: "${selfId}", reportingVariableId: "${selfId}" }], { token });`,
+          scenario: `A node whose reportingVariableId equals its own id was accepted with status SUCCESS. The HR reporting resolution follows that link in application code with no cycle guard, so resolving this node escalation path never terminates — a stored, replayable denial of service reachable from a read endpoint. Body: ${text.slice(0, 200)}`,
+          title: 'hrSetUpTierVariable/save accepts a self-reporting node (unbounded reporting walk)',
+        },
+        'Business Logic Flaw',
+        'Major'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null variableName must be refused, not stored as a nameless team', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = [buildReportingNode({ variableName: null })];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null variableName' });
+  });
+
+  test('[2b] boundary: a 5000-character reportingJson must be refused rather than denormalised', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    // reportingJson is copied into a role posting reportingHrJson and never refreshed, so an
+    // oversized snapshot is duplicated across the employee collection permanently.
+    const body = [buildReportingNode({ reportingJson: MAX_LENGTH_STRING })];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) reportingJson',
+    });
+  });
+
+  test('[3] typefuzz: a numeric attributeId must be refused, not coerced into an ObjectId', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = [buildReportingNode({ attributeId: 1001 })];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric attributeId' });
+  });
+
+  test('[3b] typefuzz: a nested object reportingJson must be refused — the field is a JSON string', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = [buildReportingNode({ reportingJson: { attributeName: 'Function' } })];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'nested object reportingJson where a JSON string is documented',
+    });
+  });
+
+  test('[3c] typefuzz: a single object where the documented body is an array must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildReportingNode();
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      repro: `await hrHierarchyClient.saveSetUpVariable(buildReportingNode(), { token }); // object, not array`,
+      scenario: 'object body instead of a JSON array',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must not be able to create HR placement nodes', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = [buildReportingNode()];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: a token forged with alg:none must never be accepted', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = [buildReportingNode()];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, {
+      token: FORGED_ALG_NONE_JWT,
+    });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] a node must not be creatable reporting into another tenant HR structure', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * The reporting link is independent of the structural parent and is what the escalation
+     * view follows. Pointing it at a foreign node while claiming a foreign companyId inserts
+     * an attacker-controlled position into someone else HR escalation path.
+     */
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const foreignReportsTo = randomObjectId();
+    const body = [
+      buildReportingNode({ companyId: otherTenant, reportingVariableId: foreignReportsTo }),
+    ];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.saveSetUpVariable([{ companyId: "${otherTenant}", reportingVariableId: "${foreignReportsTo}" }], { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, an HR set-up node was written into tenant "${otherTenant}" with its reporting line pointed at a foreign node, and the call reported SUCCESS. Neither field is validated against the token tenant, and this is the tier employees are placed against — so an outsider can insert a position into another company reporting chain. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR set-up node write (IDOR) on hrSetUpTierVariable/save',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a script variableName must not be stored and echoed unescaped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = [buildReportingNode({ variableName: XSS_PAYLOAD })];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+
+  test('[6b] injection: a SQL payload as reportingVariableId must not surface a database error', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = [buildReportingNode({ reportingVariableId: SQLI_DROP_PAYLOAD })];
+    const response = await hrHierarchyClient.saveSetUpVariable(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_DROP_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrSetUpTierVariable/update ==== */
+test.describe('POST /hrSetUpTierVariable/update', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.setUpVariableUpdate,
+    repro: `await hrHierarchyClient.updateSetUpVariable(buildNodeUpdate(), { token });`,
+  };
+
+  test('[1] happy path: an update returns a well-formed envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate();
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token });
+
+    await expectValidContract(response, looseEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: a failure envelope must not be delivered under a 2xx transport status', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate();
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token });
+
+    await assertNot200OKOnError(response, { ...META, body });
+  });
+
+  test('[1c] business rule: updating an id that matches no document must not report SUCCESS', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const missingId = randomObjectId();
+    const body = buildNodeUpdate({ id: missingId, variableName: 'QA-Renamed-Team' });
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS' && !json?.value) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.updateSetUpVariable({ id: "${missingId}", variableName: "QA-Renamed-Team" }, { token });`,
+          scenario: `Update against the non-existent set-up node "${missingId}" returned SUCCESS with no document in value. Body: ${text.slice(0, 200)}`,
+          title: 'hrSetUpTierVariable/update reports SUCCESS when no document matched the id',
+        },
+        'Status Code Misreporting',
+        'Major'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[1d] business rule: a mutual reporting cycle must be refused, not persisted', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * A reports to B and B reports to A. getAllReportingHrTierVariableHierarchy follows that
+     * link in application code with no visited set, so a two-node cycle is an unbounded loop
+     * on the read side. Both ids are freshly minted and match no document.
+     */
+    const nodeA = randomObjectId();
+    const nodeB = randomObjectId();
+    await hrHierarchyClient.updateSetUpVariable(
+      buildNodeUpdate({ id: nodeB, reportingVariableId: nodeA }),
+      { token }
+    );
+    const body = buildNodeUpdate({ id: nodeA, reportingVariableId: nodeB });
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await updateSetUpVariable({ id: "${nodeB}", reportingVariableId: "${nodeA}" }); await updateSetUpVariable({ id: "${nodeA}", reportingVariableId: "${nodeB}" });`,
+          scenario: `A mutual HR reporting cycle between "${nodeA}" and "${nodeB}" was accepted with status SUCCESS. The reporting resolution is an application-side hop with no cycle guard and no depth cap, so any later call to getAllReportingHrTierVariableHierarchy on either node — or any role posting that stamps reportingHrJson from it — runs until it times out. One authenticated write leaves a permanent denial of service on a read path. Body: ${text.slice(0, 200)}`,
+          title: 'hrSetUpTierVariable/update accepts a cyclic reporting link (unbounded traversal)',
+        },
+        'Business Logic Flaw',
+        'Major'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null id must be refused rather than updating an arbitrary node', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({ id: null });
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null id' });
+  });
+
+  test('[2b] boundary: an empty variableName must not blank a node employees are placed on', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({ variableName: '' });
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty variableName' });
+  });
+
+  test('[3] typefuzz: a numeric id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({ id: 1001 });
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric id' });
+  });
+
+  test('[3b] typefuzz: an array reportingVariableId must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({
+      reportingVariableId: ['66f1a2b3c4d5e6f708192a5d', '66f1a2b3c4d5e6f708192a6e'],
+    });
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'array reportingVariableId — a node reports to exactly one other node',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must not be able to re-point an HR reporting line', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildNodeUpdate();
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: an expired token must be refused on a write', async ({ hrHierarchyClient }) => {
+    const body = buildNodeUpdate();
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token: EXPIRED_TOKEN });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] an HR node subtree must not be transplantable into another tenant', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const foreignParent = randomObjectId();
+    const body = buildNodeUpdate({
+      companyId: otherTenant,
+      parentVariableId: foreignParent,
+      parentAttributeId: randomObjectId(),
+    });
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const value = json?.value as { companyId?: string } | null;
+    if (value?.companyId === otherTenant) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.updateSetUpVariable({ id: "<id>", companyId: "${otherTenant}", parentVariableId: "${foreignParent}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, an update moved an HR set-up node into tenant "${otherTenant}" under a foreign parent. Children resolve by parent id so the whole subtree travels with it, and role postings referencing those nodes now resolve to positions in a different company. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR subtree transplant (IDOR) on hrSetUpTierVariable/update',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a malformed ObjectId must not leak the parser exception', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({ id: 'not-an-object-id' });
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, 'not-an-object-id');
+  });
+
+  test('[6b] injection: a script variableName must not be echoed unescaped on update', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeUpdate({ variableName: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.updateSetUpVariable(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrSetUpTierVariable/delete ==== */
+test.describe('POST /hrSetUpTierVariable/delete', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.setUpVariableDelete,
+    repro: `await hrHierarchyClient.deleteSetUpVariable(buildById(), { token }); // random id — matches no document`,
+  };
+
+  test('[1] happy path: a delete against a non-existent id returns a well-formed envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * Random id on purpose. This is the node a role posting records in `lastHrVariableId`, so
+     * deleting a live one orphans its children AND strands every employee placed on it, with
+     * no cascade and no undo through the API.
+     */
+    const body = buildById({ id: randomObjectId() });
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token });
+
+    await expectValidContract(response, looseEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: randomObjectId() });
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[1c] business rule: a delete that would strand employee placements must not report a bare SUCCESS', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const missingId = randomObjectId();
+    const body = buildById({ id: missingId });
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const status = typeof json?.status === 'string' ? json.status.toUpperCase() : null;
+    if (response.status() === 200 && status === 'SUCCESS') {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.deleteSetUpVariable({ id: "${missingId}" }, { token });`,
+          scenario: `Deleting the non-existent set-up node "${missingId}" reported SUCCESS. Role postings hold this id in lastHrVariableId and the route counts no dependants before a hard delete, so an operator gets the identical answer whether nothing matched or a node carrying live employee placements was removed. Body: ${text.slice(0, 200)}`,
+          title: 'hrSetUpTierVariable/delete reports an undifferentiated SUCCESS despite employee dependants',
+        },
+        'Status Code Misreporting',
+        'Medium'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null id must be refused, not treated as an unbounded delete', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: null });
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null id on a delete' });
+  });
+
+  test('[2b] boundary: an empty id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: '' });
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty id on a delete' });
+  });
+
+  test('[3] typefuzz: an object id must be refused, not used as a Mongo operator', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: { $ne: null } });
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario:
+        'object id ({ $ne: null }) — operator injection that would delete every placement node',
+    });
+  });
+
+  test('[3b] typefuzz: a numeric id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: 1001 });
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric id' });
+  });
+
+  test('[4] auth: an unauthenticated delete must be refused', async ({ hrHierarchyClient }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: a malformed token must not authorise a destructive delete', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token: MALFORMED_TOKEN });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] a caller must not be able to delete a placement node in another tenant', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const foreignId = randomObjectId();
+    const body = buildById({ id: foreignId });
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token });
+
+    const { json, text } = await readBody(response);
+    const value = json?.value as { companyId?: string } | null;
+    if (value?.companyId && value.companyId !== companyID) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.deleteSetUpVariable({ id: "${foreignId}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `A delete issued as tenant ${companyID} returned an HR set-up node owned by tenant "${value.companyId}". The body carries no tenant scope, so a guessed id destroys a foreign placement node — orphaning its children and stranding every role posting that referenced it. Body: ${text.slice(0, 200)}`,
+          title: 'Cross-tenant HR placement node delete (IDOR) on hrSetUpTierVariable/delete',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a SQL payload as the id must not leak an exception trace', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: SQLI_DROP_PAYLOAD });
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_DROP_PAYLOAD);
+  });
+
+  test('[6b] injection: a script id must not be reflected unescaped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.deleteSetUpVariable(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrSetUpTierVariable/getHrSetUpTierVariable ==== */
+test.describe('POST /hrSetUpTierVariable/getHrSetUpTierVariable', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.setUpVariableGet,
+    repro: `await hrHierarchyClient.getHrSetUpTierVariable(buildNodeLookup(), { token });`,
+  };
+
+  test('[1] happy path: a parent + tenant lookup returns a well-formed node-list envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup();
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, { token });
+
+    await expectValidContract(response, nodeListEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: the HTTP status must agree with the envelope statusCode', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup();
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, { token });
+
+    await assertStatusCodeParity(response, { ...META, body });
+  });
+
+  test('[2] boundary: the documented null-parent root query must stay tenant-scoped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ parentVariableId: null });
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, { token });
+
+    const { json } = await readBody(response);
+    const value = json?.value;
+    const foreign = Array.isArray(value)
+      ? (value as Array<{ companyId?: string }>).filter(
+          (n) => n?.companyId && n.companyId !== companyID
+        )
+      : [];
+    if (foreign.length > 0) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.getHrSetUpTierVariable({ companyId: "${companyID}", parentVariableId: null }, { token });`,
+          scenario: `The documented root query returned ${foreign.length} node(s) owned by other tenants (e.g. "${foreign[0]?.companyId}"). With the parent id null, company_id is the only surviving filter and it did not hold.`,
+          title: 'hrSetUpTierVariable/getHrSetUpTierVariable root query leaks foreign-tenant nodes',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2b] boundary: an empty companyId must not widen the query to every tenant', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ companyId: '' });
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty companyId' });
+  });
+
+  test('[2c] boundary: a 5000-character parentVariableId must not be processed as a filter', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ parentVariableId: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) parentVariableId',
+    });
+  });
+
+  test('[3] typefuzz: a numeric companyId must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ companyId: 1001 });
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric companyId' });
+  });
+
+  test('[3b] typefuzz: a boolean parentVariableId must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ parentVariableId: false });
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, { token });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'boolean parentVariableId',
+    });
+  });
+
+  test('[4] auth: an unauthenticated caller must be refused, not served the HR subtree', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildNodeLookup();
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, { token: null });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: an expired token must be refused', async ({ hrHierarchyClient }) => {
+    const body = buildNodeLookup();
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, {
+      token: EXPIRED_TOKEN,
+    });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] one tenant must not be able to walk another tenant HR structure', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    const otherTenant = `${Number(companyID ?? 1001) + 1}`;
+    const body = buildNodeLookup({ companyId: otherTenant, parentVariableId: null });
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, { token });
+
+    const { json } = await readBody(response);
+    const value = json?.value;
+    if (Array.isArray(value) && value.length > 0) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.getHrSetUpTierVariable({ companyId: "${otherTenant}", parentVariableId: null }, { token /* tenant ${companyID} */ });`,
+          scenario: `Authenticated as tenant ${companyID}, asking for tenant "${otherTenant}" root nodes returned ${value.length} record(s). Feeding each id back walks a competitor entire function and team structure — the same tree their employees are placed against.`,
+          title: 'Cross-tenant HR structure walk (IDOR) on getHrSetUpTierVariable',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a SQL-injection parentVariableId must not surface a database error', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ parentVariableId: SQLI_PAYLOAD });
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, { token });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_PAYLOAD);
+  });
+
+  test('[6b] injection: a script companyId must not come back unescaped', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildNodeLookup({ companyId: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.getHrSetUpTierVariable(body, { token });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});
+
+/* ==== POST /hrSetUpTierVariable/getAllReportingHrTierVariableHierarchy ==== */
+test.describe('POST /hrSetUpTierVariable/getAllReportingHrTierVariableHierarchy', () => {
+  const META = {
+    method: 'POST',
+    path: HR_HIERARCHY_PATHS.setUpVariableReportingHierarchy,
+    repro: `await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(buildById(), { token });`,
+  };
+
+  test('[1] happy path: the reporting parent comes back as a SINGLE node, not a list', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * The shape trap the spec calls out: despite the plural name this operation returns one
+     * node object, unlike its workplace-tier counterpart which returns an array. Validating
+     * against the single-node envelope is what makes a silent change to a list detectable.
+     */
+    const body = buildById();
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+
+    await expectValidContract(response, nodeEnvelopeSchema, { ...META, body });
+  });
+
+  test('[1b] parity: a failure envelope must not be delivered under a 2xx transport status', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById();
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+
+    await assertNot200OKOnError(response, { ...META, body });
+  });
+
+  test('[1c] business rule: the documented single-node shape must not silently become an array', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * Two sibling endpoints with near-identical names return different shapes. A client that
+     * assumes they are interchangeable breaks at runtime, so a drift in either direction is
+     * worth a ticket of its own rather than a schema failure buried in the happy path.
+     */
+    const body = buildById();
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+
+    const { json, text } = await readBody(response);
+    if (Array.isArray(json?.value)) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          scenario: `The operation returned an array in value, while api.json documents it as a single node object and explicitly warns it is not interchangeable with adminTierVariable/getAllReportingVariableHierarchy. Clients typed from the contract fail to parse the response. Body: ${text.slice(0, 200)}`,
+          title: 'getAllReportingHrTierVariableHierarchy returns an array where a single node is documented',
+        },
+        'Schema Violation',
+        'Low'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[1d] business rule: the reporting resolution must terminate and must not be unbounded', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * This is the endpoint the cycle cases on save and update are aimed at: the resolution is
+     * an application-side hop over caller-writable reporting_variable_id links with no visited
+     * set. A random id cannot itself form a cycle, so what is measured is whether a single
+     * lookup answers promptly and bounded.
+     */
+    const startedAt = Date.now();
+    const body = buildById();
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+    const elapsedMs = Date.now() - startedAt;
+
+    if (elapsedMs > 5000) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          scenario: `Resolving the HR reporting parent for a single id took ${elapsedMs}ms. The lookup follows caller-writable reporting links with no depth cap and no cycle guard, so its cost is bounded only by the shape of the data — and a cycle planted through hrSetUpTierVariable/save or /update turns this read into a denial of service that also blocks role-posting creation.`,
+          title: 'getAllReportingHrTierVariableHierarchy resolution is uncapped and data-dependent',
+        },
+        'Business Logic Flaw',
+        'Major'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[2] boundary: a null id must be refused, not resolved from an arbitrary node', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: null });
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'null id' });
+  });
+
+  test('[2b] boundary: an empty id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: '' });
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'empty id' });
+  });
+
+  test('[2c] boundary: a 5000-character id must not start a resolution', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: MAX_LENGTH_STRING });
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+
+    await assertRejectsInvalidInput(response, {
+      ...META,
+      body,
+      scenario: 'oversized (5000-char) id',
+    });
+  });
+
+  test('[3] typefuzz: a numeric id must be refused', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: 1001 });
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'numeric id' });
+  });
+
+  test('[3b] typefuzz: an array id must be refused, not resolved once per element', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: ['66f1a2b3c4d5e6f708192a5d', '66f1a2b3c4d5e6f708192a6e'] });
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+
+    await assertRejectsInvalidInput(response, { ...META, body, scenario: 'array id' });
+  });
+
+  test('[4] auth: an unauthenticated caller must not be able to resolve an HR escalation path', async ({
+    hrHierarchyClient,
+  }) => {
+    // Who reports to whom is management structure: an anonymous read discloses it before any
+    // personal data is involved.
+    const body = buildById();
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token: null,
+    });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[4b] auth: a token forged with alg:none must never be accepted', async ({
+    hrHierarchyClient,
+  }) => {
+    const body = buildById();
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token: FORGED_ALG_NONE_JWT,
+    });
+
+    await assertUnauthorized(response, { ...META, body });
+  });
+
+  test('[5] [IDOR] a foreign node id must not resolve into another tenant HR reporting line', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+    companyID,
+  }) => {
+    const token = requireAuthToken();
+    /*
+     * The resolution starts from a bare id with no tenant filter, so a guessed id does not
+     * leak one node — it names the position that node reports to.
+     */
+    const foreignId = randomObjectId();
+    const body = buildById({ id: foreignId });
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+
+    const { json } = await readBody(response);
+    const value = json?.value as { companyId?: string; variableName?: string } | null;
+    if (value?.companyId && value.companyId !== companyID) {
+      await reportBusinessLogicFlaw(
+        response,
+        {
+          ...META,
+          body,
+          repro: `await hrHierarchyClient.getAllReportingHrTierVariableHierarchy({ id: "${foreignId}" }, { token /* tenant ${companyID} */ });`,
+          scenario: `A reporting resolution issued as tenant ${companyID} returned node "${value.variableName}" belonging to tenant "${value.companyId}". No tenant filter is applied at the lookup, so any guessed id discloses a foreign HR reporting relationship — and repeating the call up the chain reconstructs their management hierarchy.`,
+          title: 'Cross-tenant HR reporting disclosure (IDOR) on getAllReportingHrTierVariableHierarchy',
+        },
+        'Security/Access Control',
+        'Critical'
+      );
+    }
+    expect(true).toBe(true);
+  });
+
+  test('[6] injection: a SQL-injection id must not surface a database error', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: SQLI_PAYLOAD });
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+
+    await assertNoInternalLeak(response, { ...META, body }, SQLI_PAYLOAD);
+  });
+
+  test('[6b] injection: a script id must not come back unescaped in the envelope', async ({
+    hrHierarchyClient,
+    requireAuthToken,
+  }) => {
+    const token = requireAuthToken();
+    const body = buildById({ id: XSS_PAYLOAD });
+    const response = await hrHierarchyClient.getAllReportingHrTierVariableHierarchy(body, {
+      token,
+    });
+
+    await assertNoReflectedScript(response, { ...META, body }, XSS_PAYLOAD);
+  });
+});

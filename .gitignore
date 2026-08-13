@@ -1,0 +1,23 @@
+node_modules/
+dist/
+reports/
+playwright-report/
+test-results/
+# Every env file except the documented template. Playwright's loader also reads
+# .env.local, and a committed credential is not recoverable from a public repo —
+# doubly so here, where .env holds ADMIN_JWT_SECRET, the server's token signing key.
+.env
+.env.*
+!.env.example
+*.log
+.bug-cache/
+
+# Generated per-run digest artifacts. BUG_REPORT.md / BUG_REPORT.json are deliberately NOT
+# ignored: they are the deliverable this suite exists to produce and are reviewed in diffs.
+DEV_DIGEST.md
+DEV_DIGEST.json
+
+# Build output of the standalone tsc steps (vector audit, scorecard, tracker dispatch)
+.audit-build/
+.scorecard-build/
+.dispatch-build/

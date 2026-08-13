@@ -1,0 +1,48 @@
+{
+  "name": "kpost-admin-testbench",
+  "version": "1.0.0",
+  "description": "Playwright API test automation framework for the KPOST Admin Module API",
+  "scripts": {
+    "test": "playwright test",
+    "test:users": "playwright test --project=users",
+    "test:departments": "playwright test --project=departments",
+    "test:designations": "playwright test --project=designations",
+    "test:rolePostings": "playwright test --project=rolePostings",
+    "test:locations": "playwright test --project=workplaceLocations",
+    "test:employees": "playwright test --project=employeeMaster",
+    "test:holidays": "playwright test --project=holidayCalendar",
+    "test:products": "playwright test --project=productLicensing",
+    "test:workplace": "playwright test --project=workplaceHierarchy",
+    "test:hr": "playwright test --project=hrHierarchy",
+    "test:reference": "playwright test --project=referenceData",
+    "test:list": "playwright test --list --reporter=json",
+    "test:no-onboarding": "playwright test --grep-invert \"userDetails/sendOTP\\|userDetails/registration\\|userDetails/signUp\\|userDetails/save\\|userDetails/resetPassword\\|userDetails/createCommunicationId\\|demo/createDemoRequest\"",
+    "test:skip-audit": "playwright test",
+    "generate": "node scripts/generateModuleOwnership.js",
+    "typecheck": "tsc --noEmit",
+    "pretest": "npm run audit:vectors",
+    "audit:vectors": "tsc scripts/audit-vectors.ts --ignoreConfig --module commonjs --target es2022 --esModuleInterop --skipLibCheck --types node --outDir .audit-build && node .audit-build/audit-vectors.js",
+    "scorecard": "tsc reporters/generate-scorecard.ts --ignoreConfig --module commonjs --target es2022 --esModuleInterop --skipLibCheck --types node --outDir .scorecard-build && npx playwright test --list --reporter=json > .scorecard-build/test-list.json && node .scorecard-build/generate-scorecard.js .scorecard-build/test-list.json",
+    "seed": "node scripts/run-seed.js",
+    "clean": "node scripts/clean.js",
+    "report": "playwright show-report reports/diagnostic",
+    "report:diagnostic": "playwright show-report reports/diagnostic",
+    "report:executive": "node scripts/print-executive-path.js",
+    "notify": "node scripts/print-digest.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@faker-js/faker": "^10.5.0",
+    "dotenv": "^17.4.2",
+    "jsonwebtoken": "^9.0.2",
+    "@types/jsonwebtoken": "^9.0.7",
+    "zod": "^4.4.3"
+  }
+}
